@@ -72,7 +72,7 @@ public final class UITheme {
             char c = raw.charAt(i);
             if (Character.isWhitespace(c)) {
                 run = 0;
-            } else if (++run > 32) {
+            } else if (!Character.isLowSurrogate(c) && ++run > 32) {
                 sb.append(' ');
                 run = 1;
             }

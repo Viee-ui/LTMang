@@ -45,11 +45,15 @@ public final class PacketIO {
         out.flush();
     }
 
-    /** Nhận một gói tin; đối tượng không phải Packet bị coi là lỗi giao thức. */
+    /** Nhận một gói tin; đối tượng không phải Packet hoặc thiếu loại bị coi là lỗi giao thức. */
     public static Packet receive(ObjectInputStream in) throws IOException {
         try {
             Object o = in.readObject();
-            if (o instanceof Packet) return (Packet) o;
+            if (o instanceof Packet) {
+                Packet p = (Packet) o;
+                if (p.getType() == null) throw new IOException("Gói tin thiếu loại.");
+                return p;
+            }
             throw new IOException("Gói tin không hợp lệ.");
         } catch (ClassNotFoundException e) {
             throw new IOException("Gói tin không hợp lệ.", e);

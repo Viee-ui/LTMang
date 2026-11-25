@@ -19,8 +19,11 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -50,9 +53,10 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
     private boolean updatingList;         // true khi đang nạp lại JList -> bỏ qua sự kiện chọn
     private File lastDirectory = new File(System.getProperty("user.home"));
 
-    // Chống spam invokeLater khi PeerNode báo cùng một % nhiều lần (đọc ở luồng mạng nên volatile)
-    private volatile int lastPercent = -1;
-    private volatile String lastPercentFile = "";
+    // Theo dõi các phiên truyền file song song (chống spam invokeLater & không ẩn sớm thanh tiến trình)
+    private final Map<String, Integer> progressCache = new ConcurrentHashMap<>();
+    private final Set<String> activeTransfers = new HashSet<>();               // chỉ dùng trên EDT
+    private final Map<String, String> savedFileToOfferKey = new HashMap<>();   // chỉ dùng trên EDT
 
     // ---- Luồng nền cho các lệnh có thể chặn ----
     private final ExecutorService messageExecutor = Executors.newSingleThreadExecutor(daemon("msg-sender")); // giữ đúng thứ tự tin nhắn
@@ -272,10 +276,7 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
     public void onMessageReceived(String fromUser, String content) {
         SwingUtilities.invokeLater(() -> {
             addToHistory(fromUser, formatTheirs(fromUser, content));
-            if (!fromUser.equals(currentPeer)) {
-                unreadCounts.merge(fromUser, 1, Integer::sum);
-                lstPeers.repaint();
-            }
+            markUnreadIfOther(fromUser);
         });
     }
 
@@ -286,13 +287,16 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
 
     @Override
     public void onFileProgress(String peerName, String fileName, int percent, boolean sending) {
-        if (percent == lastPercent && fileName.equals(lastPercentFile)) return;
-        lastPercent = percent;
-        lastPercentFile = fileName;
+        final String safeFile = fileName == null ? "" : fileName;
+        final String key = transferKey(peerName, safeFile, sending);
+        Integer prev = progressCache.put(key, percent);
+        if (prev != null && prev == percent) return;
         SwingUtilities.invokeLater(() -> {
+            activeTransfers.add(key);
             transferPanel.setVisible(true);
-            lblTransfer.setText((sending ? "Đang gửi \"" : "Đang nhận \"") + fileName
-                    + (sending ? "\" tới " : "\" từ ") + peerName);
+            String extra = activeTransfers.size() > 1 ? "  (+" + (activeTransfers.size() - 1) + " file khác)" : "";
+            lblTransfer.setText((sending ? "Đang gửi \"" : "Đang nhận \"") + safeFile
+                    + (sending ? "\" tới " : "\" từ ") + peerName + extra);
             progressBar.setValue(percent);
             progressBar.setString(percent + "%");
         });
@@ -301,17 +305,23 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
     @Override
     public void onFileReceived(String fromUser, File savedFile) {
         SwingUtilities.invokeLater(() -> {
-            hideTransfer();
+            String key = savedFileToOfferKey.remove(savedFile.getAbsolutePath());
+            if (key == null) key = transferKey(fromUser, savedFile.getName(), false);
+            finishTransfer(key);
             addSystemLine(fromUser, "Đã nhận file \"" + savedFile.getName() + "\" ("
                     + UITheme.formatSize(savedFile.length()) + "). Lưu tại: " + savedFile.getAbsolutePath());
+            markUnreadIfOther(fromUser);
         });
     }
 
     @Override
     public void onFileFailed(String peerName, String fileName, String reason) {
         SwingUtilities.invokeLater(() -> {
-            hideTransfer();
+            String key = transferKey(peerName, fileName, false);
+            savedFileToOfferKey.values().removeIf(k -> k.equals(key));
+            finishTransfer(key);
             addSystemLine(peerName, "Truyền file \"" + fileName + "\" thất bại: " + reason);
+            markUnreadIfOther(peerName);
         });
     }
 
@@ -320,6 +330,7 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
         SwingUtilities.invokeLater(() -> {
             lblMyStatus.setIcon(new UITheme.DotIcon(UITheme.OFFLINE, 10));
             lblMyStatus.setText("Mất kết nối Tracker");
+            lblMyStatus.setToolTipText(reason);
             lblOnlineCaption.setText("DANH SÁCH CÓ THỂ ĐÃ CŨ");
         });
     }
@@ -348,6 +359,7 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
 
         lblMyStatus.setIcon(new UITheme.DotIcon(UITheme.ONLINE, 10));
         lblMyStatus.setText("Online");
+        lblMyStatus.setToolTipText(null);
         updateOnlineCaption();
 
         if (currentPeer == null) {
@@ -519,26 +531,40 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
         addSystemLine(target, "Đang gửi file \"" + file.getName() + "\" (" + UITheme.formatSize(file.length())
                 + ") tới " + target + "... Chờ đối phương chấp nhận.");
 
+        final String sendKey = transferKey(target, file.getName(), true);
         fileExecutor.submit(() -> {
             try {
                 peerService.sendFile(target, file);   // chặn tới khi xong, tiến trình về qua onFileProgress
                 SwingUtilities.invokeLater(() -> {
-                    hideTransfer();
+                    finishTransfer(sendKey);
                     addSystemLine(target, "Đã gửi file \"" + file.getName() + "\" thành công.");
                 });
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> {
-                    hideTransfer();
+                    finishTransfer(sendKey);
                     addSystemLine(target, "Gửi file \"" + file.getName() + "\" thất bại: " + describe(ex));
                 });
             }
         });
     }
 
-    private void hideTransfer() {
-        transferPanel.setVisible(false);
-        lastPercent = -1;
-        lastPercentFile = "";
+    private void finishTransfer(String key) {
+        progressCache.remove(key);
+        activeTransfers.remove(key);
+        if (activeTransfers.isEmpty()) {
+            transferPanel.setVisible(false);
+        }
+    }
+
+    private static String transferKey(String peerName, String fileName, boolean sending) {
+        return (sending ? "S:" : "R:") + peerName + ":" + (fileName == null ? "" : fileName);
+    }
+
+    private void markUnreadIfOther(String peer) {
+        if (!peer.equals(currentPeer)) {
+            unreadCounts.merge(peer, 1, Integer::sum);
+            lstPeers.repaint();
+        }
     }
 
     // =====================================================================
@@ -548,11 +574,12 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
     private void handleFileOffer(String fromUser, String fileName, long fileSize, FileOfferResponder responder) {
         // Tên file do đối phương gửi -> chỉ lấy phần tên, bỏ mọi đường dẫn (chống "../../")
         String safeName = new File(fileName).getName();
-        if (safeName.isEmpty()) safeName = "file_nhan_duoc";
+        if (safeName.isEmpty() || ".".equals(safeName) || "..".equals(safeName)) safeName = "file_nhan_duoc";
 
         int choice = JOptionPane.showConfirmDialog(this,
                 fromUser + " muốn gửi cho bạn một file:\n\n" + safeName + "  (" + UITheme.formatSize(fileSize) + ")\n\nBạn có muốn nhận không?",
                 "Yêu cầu nhận file", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (responder.isExpired()) return;
         if (choice != JOptionPane.YES_OPTION) {
             responder.reject();
             addSystemLine(fromUser, "Bạn đã từ chối nhận file \"" + safeName + "\".");
@@ -563,8 +590,10 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
         chooser.setDialogTitle("Chọn nơi lưu file");
         chooser.setSelectedFile(new File(lastDirectory, safeName));
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
-            responder.reject();
-            addSystemLine(fromUser, "Bạn đã hủy nhận file \"" + safeName + "\".");
+            if (!responder.isExpired()) {
+                responder.reject();
+                addSystemLine(fromUser, "Bạn đã hủy nhận file \"" + safeName + "\".");
+            }
             return;
         }
         File target = chooser.getSelectedFile();
@@ -573,11 +602,15 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
         if (target.exists() && JOptionPane.showConfirmDialog(this,
                 "File \"" + target.getName() + "\" đã tồn tại. Ghi đè?", "Xác nhận",
                 JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
-            responder.reject();
-            addSystemLine(fromUser, "Bạn đã hủy nhận file \"" + safeName + "\" (không ghi đè).");
+            if (!responder.isExpired()) {
+                responder.reject();
+                addSystemLine(fromUser, "Bạn đã hủy nhận file \"" + safeName + "\" (không ghi đè).");
+            }
             return;
         }
+        if (responder.isExpired()) return;
 
+        savedFileToOfferKey.put(target.getAbsolutePath(), transferKey(fromUser, safeName, false));
         responder.accept(target);
         addSystemLine(fromUser, "Đang nhận file \"" + safeName + "\" từ " + fromUser + "...");
     }

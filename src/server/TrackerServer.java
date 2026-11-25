@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -91,6 +92,7 @@ public class TrackerServer {
     private void handleClient(Socket socket) {
         Session session = null;
         String name = null;
+        String nameKey = null;
         try {
             socket.setKeepAlive(true);
             socket.setSoTimeout(10_000);                    // phải đăng ký xong trong 10 giây, tránh kết nối "treo"
@@ -104,17 +106,21 @@ public class TrackerServer {
                 return;
             }
             name = first.getSender().trim();
+            nameKey = name.toLowerCase(Locale.ROOT);                // không cho trùng tên chỉ khác hoa/thường
             String ip = socket.getInetAddress().getHostAddress();   // IP lấy từ kết nối thật, không tin client tự khai
             session = new Session(socket, out, new PeerInfo(name, ip, first.getPort()));
 
-            if (sessions.putIfAbsent(name, session) != null) {      // putIfAbsent: kiểm tra + thêm là một thao tác nguyên tử
-                session = null;                                     // không phải phiên của mình -> không xóa ở finally
-                PacketIO.send(out, Packet.registerFail("Username \"" + name + "\" đã có người dùng. Hãy chọn tên khác."));
-                return;
+            // Giữ khóa trên session trong lúc thêm vào map + gửi REGISTER_OK để broadcastOnlineList()
+            // từ luồng khác không thể chen gói ONLINE_LIST lên trước REGISTER_OK.
+            synchronized (session) {
+                if (sessions.putIfAbsent(nameKey, session) != null) { // kiểm tra + thêm là một thao tác nguyên tử
+                    session = null;                                   // không phải phiên của mình -> không xóa ở finally
+                    PacketIO.send(out, Packet.registerFail("Username \"" + name + "\" đã có người dùng. Hãy chọn tên khác."));
+                    return;
+                }
+                socket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);   // đăng ký xong: im lặng quá lâu = Peer đã chết
+                session.send(Packet.registerOk(ip, snapshot()));
             }
-
-            socket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);     // đăng ký xong: im lặng quá lâu = Peer đã chết
-            session.send(Packet.registerOk(ip, snapshot()));
             log("+ " + name + " online tại " + ip + ":" + first.getPort() + "  (đang online: " + sessions.size() + ")");
             broadcastOnlineList();
 
@@ -131,7 +137,7 @@ public class TrackerServer {
         } catch (IOException e) {
             log("Lỗi với " + (name != null ? name : socket.getRemoteSocketAddress()) + ": " + e.getMessage());
         } finally {
-            if (session != null && sessions.remove(name, session)) {   // chỉ xóa (và thông báo) nếu vẫn là phiên của mình
+            if (session != null && sessions.remove(nameKey, session)) { // chỉ xóa (và thông báo) nếu vẫn là phiên của mình
                 log("- " + name + " offline  (đang online: " + sessions.size() + ")");
                 broadcastOnlineList();
             }

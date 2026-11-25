@@ -72,6 +72,8 @@ public class NetTest {
         PeerNode dup = new PeerNode(); dup.setListener(new Rec());
         try { dup.start("Alice", "127.0.0.1", tp, 0); check("trùng username phải bị từ chối", false); }
         catch (IOException e) { check("trùng username bị từ chối: \"" + e.getMessage() + "\"", e.getMessage().contains("đã có người dùng")); }
+        try { dup.start("alice", "127.0.0.1", tp, 0); check("trùng username khác hoa/thường phải bị từ chối", false); }
+        catch (IOException e) { check("trùng username khác hoa/thường bị từ chối", e.getMessage().contains("đã có người dùng")); }
         try { dup.start("a<b>", "127.0.0.1", tp, 0); check("username sai định dạng phải bị từ chối", false); }
         catch (IOException e) { check("username sai định dạng bị Tracker từ chối", true); }
         // dup đã dọn sạch -> đăng nhập lại với tên khác được (không bị 'port bận')
@@ -79,6 +81,37 @@ public class NetTest {
         check("sau khi lỗi vẫn đăng nhập lại được", waitFor(() -> ra.seen("Carol"), 2000));
         dup.stop();
         check("Carol thoát -> A thấy Carol biến mất", waitFor(() -> !ra.seen("Carol"), 2000));
+
+        // ---------- Đăng nhập đồng thời (kiểm tra race condition REGISTER_OK vs ONLINE_LIST) ----------
+        int burst = 10;
+        ExecutorService burstPool = Executors.newFixedThreadPool(burst);
+        CountDownLatch ready = new CountDownLatch(burst);
+        CountDownLatch go = new CountDownLatch(1);
+        List<PeerNode> burstNodes = Collections.synchronizedList(new ArrayList<>());
+        List<Future<Boolean>> burstFutures = new ArrayList<>();
+        for (int idx = 0; idx < burst; idx++) {
+            final String uname = "Burst" + idx;
+            burstFutures.add(burstPool.submit(() -> {
+                PeerNode node = new PeerNode();
+                node.setListener(new Rec());
+                ready.countDown();
+                go.await();
+                node.start(uname, "127.0.0.1", tp, 0);
+                burstNodes.add(node);
+                return true;
+            }));
+        }
+        ready.await(3, TimeUnit.SECONDS);
+        go.countDown();
+        boolean allBurstOk = true;
+        for (Future<Boolean> f : burstFutures) {
+            try { if (!Boolean.TRUE.equals(f.get(5, TimeUnit.SECONDS))) allBurstOk = false; }
+            catch (Exception e) { allBurstOk = false; }
+        }
+        check(burst + " peer đăng nhập cùng lúc đều thành công", allBurstOk && burstNodes.size() == burst);
+        for (PeerNode n : burstNodes) n.stop();
+        burstPool.shutdownNow();
+        check("sau khi " + burst + " peer thoát, danh sách trở lại bình thường", waitFor(() -> !ra.seen("Burst0"), 3000));
 
         // ---------- Sai Tracker ----------
         PeerNode bad = new PeerNode(); bad.setListener(new Rec());
@@ -149,15 +182,25 @@ public class NetTest {
             common.PacketIO.receive(i);
         }
         check("tên file '../../etc/passwd' được rút gọn còn 'passwd'", "passwd".equals(rb.offeredName));
+        try (Socket s = new Socket("127.0.0.1", B.getP2pPort())) {
+            ObjectOutputStream o = common.PacketIO.openOutput(s); ObjectInputStream i = common.PacketIO.openInput(s);
+            common.PacketIO.send(o, common.Packet.fileOffer("Evil", "..", 10));
+            common.Packet reply = common.PacketIO.receive(i);
+            check("tên file '..' bị từ chối ngay", reply.getType() == common.PacketType.FILE_REJECT);
+        }
 
         // ---------- Bộ lọc deserialization ----------
+        boolean filterClosed = false;
         try (Socket s = new Socket("127.0.0.1", B.getP2pPort())) {
-            ObjectOutputStream o = new ObjectOutputStream(s.getOutputStream());
-            o.writeObject(new java.util.concurrent.atomic.AtomicInteger(5)); o.flush();   // lớp ngoài danh sách trắng
             s.setSoTimeout(2000);
-            int r = s.getInputStream().read();
-            check("đối tượng lạ bị chặn, kết nối bị đóng (read=" + r + ")", r == -1 || true);
-        } catch (Exception e) { check("đối tượng lạ bị chặn (" + e.getClass().getSimpleName() + ")", true); }
+            ObjectOutputStream o = common.PacketIO.openOutput(s);
+            ObjectInputStream i = common.PacketIO.openInput(s);
+            o.writeObject(new java.util.concurrent.atomic.AtomicInteger(5)); o.flush();   // lớp ngoài danh sách trắng
+            i.readObject();
+        } catch (EOFException | SocketException e) {
+            filterClosed = true;
+        }
+        check("đối tượng lạ bị chặn, kết nối bị đóng", filterClosed);
         A.sendMessage("Bob", "vẫn sống");
         check("sau tấn công B vẫn hoạt động bình thường", "Alice:vẫn sống".equals(rb.msgs.poll(2, TimeUnit.SECONDS)));
 
@@ -173,6 +216,20 @@ public class NetTest {
         check("Bob đăng nhập lại được", waitFor(() -> ra.seen("Bob"), 2000));
         A.sendMessage("Bob", "chào Bob mới");
         check("A gửi được cho Bob (cổng mới), không dùng nhầm kết nối cũ", "Alice:chào Bob mới".equals(rb2.msgs.poll(2, TimeUnit.SECONDS)));
+
+        // ---------- Heartbeat timeout (chỉ chạy nhanh khi cấu hình -Dp2p.heartbeat.timeout<=2000) ----------
+        if (common.Protocol.HEARTBEAT_TIMEOUT_MS <= 2000) {
+            try (Socket silent = new Socket("127.0.0.1", tp)) {
+                ObjectOutputStream o = common.PacketIO.openOutput(silent);
+                ObjectInputStream i = common.PacketIO.openInput(silent);
+                common.PacketIO.send(o, common.Packet.register("Ghost", 55555));
+                common.PacketIO.receive(i);   // REGISTER_OK
+                check("Ghost đăng ký xong xuất hiện trên A", waitFor(() -> ra.seen("Ghost"), 1000));
+                // Không gửi PING -> Tracker phải tự xóa Ghost sau HEARTBEAT_TIMEOUT_MS
+                check("Ghost im lặng mất heartbeat -> bị Tracker xóa", waitFor(() -> !ra.seen("Ghost"), common.Protocol.HEARTBEAT_TIMEOUT_MS + 1500));
+            }
+            check("A vẫn còn online nhờ gửi PING đều đặn", ra.seen("Alice") && !ra.trackerLost.get());
+        }
 
         // ---------- Tắt Tracker: chat P2P vẫn chạy ----------
         tracker.stop();

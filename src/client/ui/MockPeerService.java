@@ -5,9 +5,7 @@ import common.PeerInfo;
 import java.io.File;
 import java.io.IOException;
 import java.net.ConnectException;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -28,6 +26,7 @@ public class MockPeerService implements PeerService {
         return t;
     });
     private volatile ChatUIListener listener;
+    private volatile boolean stopped;
     private String username;
     private int p2pPort;
 
@@ -68,7 +67,7 @@ public class MockPeerService implements PeerService {
                 java.nio.file.Files.write(target.toPath(), new byte[]{'d', 'e', 'm', 'o'});
                 listener.onFileReceived("Bob", target);
             } catch (Exception e) {
-                listener.onFileFailed("Bob", "bao_cao_cuoi_ky.pdf", String.valueOf(e.getMessage()));
+                if (!stopped) listener.onFileFailed("Bob", "bao_cao_cuoi_ky.pdf", String.valueOf(e.getMessage()));
             }
         });
     }
@@ -91,7 +90,7 @@ public class MockPeerService implements PeerService {
         }
     }
 
-    @Override public void stop() { scheduler.shutdownNow(); }
+    @Override public void stop() { stopped = true; scheduler.shutdownNow(); }
     @Override public String getUsername() { return username; }
     @Override public String getLocalIp() { return "192.168.1.10"; }
     @Override public int getP2pPort() { return p2pPort; }

@@ -71,6 +71,7 @@ public class PeerNode implements PeerService {
     private Socket trackerSocket;
     private ObjectOutputStream trackerOut;
     private final Object trackerLock = new Object();   // heartbeat và UNREGISTER cùng ghi vào trackerOut
+    private final Object onlineLock = new Object();    // cập nhật danh sách online tuần tự, tránh ghi đè ngược thứ tự
     private ExecutorService pool;
 
     /** username -> địa chỉ P2P (cập nhật mỗi khi Tracker gửi danh sách mới). */
@@ -93,7 +94,7 @@ public class PeerNode implements PeerService {
     public synchronized void start(String username, String trackerHost, int trackerPort, int requestedPort)
             throws IOException {
         if (running) throw new IllegalStateException("PeerNode đã chạy rồi.");
-        this.username = username;
+        this.username = username == null ? "" : username.trim();
         try {
             // 1. Mở ServerSocket để các Peer khác kết nối vào (cổng 0 = hệ điều hành chọn cổng trống)
             serverSocket = new ServerSocket(requestedPort);
@@ -108,15 +109,16 @@ public class PeerNode implements PeerService {
             ObjectInputStream trackerIn = PacketIO.openInput(trackerSocket);
 
             // 3. Đăng ký và chờ Tracker trả lời
-            PacketIO.send(trackerOut, Packet.register(username, p2pPort));
+            PacketIO.send(trackerOut, Packet.register(this.username, p2pPort));
             Packet reply = PacketIO.receive(trackerIn);
             if (reply.getType() == PacketType.REGISTER_FAIL) throw new IOException(reply.getContent());
             if (reply.getType() != PacketType.REGISTER_OK) throw new IOException("Tracker trả lời không hợp lệ.");
             trackerSocket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);   // Tracker im lặng quá lâu = coi như mất
             localIp = reply.getContent();
 
-            // 4. Chạy các luồng nền
+            // 4. Nạp danh sách online ban đầu TRƯỚC khi chạy trackerLoop để tránh gói cũ ghi đè gói mới / đè trạng thái mất kết nối
             running = true;
+            handleOnlineList(reply.getPeers());
             pool = Executors.newCachedThreadPool(r -> {
                 Thread t = new Thread(r, "peer-net");
                 t.setDaemon(true);
@@ -125,7 +127,6 @@ public class PeerNode implements PeerService {
             pool.execute(this::acceptLoop);
             pool.execute(() -> trackerLoop(trackerIn));
             pool.execute(this::heartbeatLoop);
-            handleOnlineList(reply.getPeers());
         } catch (IOException | RuntimeException e) {
             closeAll();            // thất bại giữa chừng: dọn sạch để lần đăng nhập sau không bị "port đang bận"
             throw e;
@@ -204,22 +205,24 @@ public class PeerNode implements PeerService {
     }
 
     private void handleOnlineList(List<PeerInfo> list) {
-        Map<String, PeerInfo> fresh = new HashMap<>();
-        for (PeerInfo p : list) fresh.put(p.getUsername(), p);
+        synchronized (onlineLock) {
+            Map<String, PeerInfo> fresh = new HashMap<>();
+            for (PeerInfo p : list) fresh.put(p.getUsername(), p);
 
-        onlinePeers.keySet().retainAll(fresh.keySet());
-        onlinePeers.putAll(fresh);
+            onlinePeers.keySet().retainAll(fresh.keySet());
+            onlinePeers.putAll(fresh);
 
-        // Đóng kết nối cũ tới Peer đã offline hoặc đã đổi địa chỉ (đăng nhập lại ở cổng khác)
-        for (Map.Entry<String, PeerConnection> e : connections.entrySet()) {
-            PeerInfo now = fresh.get(e.getKey());
-            if (now == null || !now.getAddress().equals(e.getValue().address)) {
-                connections.remove(e.getKey(), e.getValue());
-                e.getValue().close();
+            // Đóng kết nối cũ tới Peer đã offline hoặc đã đổi địa chỉ (đăng nhập lại ở cổng khác)
+            for (Map.Entry<String, PeerConnection> e : connections.entrySet()) {
+                PeerInfo now = fresh.get(e.getKey());
+                if (now == null || !now.getAddress().equals(e.getValue().address)) {
+                    connections.remove(e.getKey(), e.getValue());
+                    e.getValue().close();
+                }
             }
+            ChatUIListener l = ui;
+            if (l != null) l.onOnlineListUpdated(new ArrayList<>(list));
         }
-        ChatUIListener l = ui;
-        if (l != null) l.onOnlineListUpdated(new ArrayList<>(list));
     }
 
     // =====================================================================
@@ -244,6 +247,7 @@ public class PeerNode implements PeerService {
     /** Xử lý một kết nối đến: lặp đọc gói tin cho tới khi đối phương đóng kết nối. */
     private void handleIncoming(Socket socket) {
         try (Socket s = socket) {
+            s.setKeepAlive(true);
             s.setSoTimeout(5_000);             // kết nối "câm" không gửi header thì bỏ
             ObjectOutputStream out = PacketIO.openOutput(s);
             ObjectInputStream in = PacketIO.openInput(s);
@@ -279,7 +283,7 @@ public class PeerNode implements PeerService {
         final String name = new File(offer.getFileName() == null ? "" : offer.getFileName()).getName();
         final long size = offer.getFileSize();
         ChatUIListener l = ui;
-        if (name.isEmpty() || size < 0 || l == null) {
+        if (name.isEmpty() || ".".equals(name) || "..".equals(name) || size < 0 || l == null) {
             PacketIO.send(out, Packet.fileReject("Yêu cầu gửi file không hợp lệ."));
             return;
         }
@@ -287,17 +291,26 @@ public class PeerNode implements PeerService {
         // Hỏi giao diện và CHỜ câu trả lời (luồng này chặn, nhưng EDT thì không)
         CompletableFuture<File> decision = new CompletableFuture<>();
         l.onFileOffered(from, name, size, new FileOfferResponder() {
-            @Override public void accept(File saveTo) { decision.complete(saveTo); }
+            @Override public void accept(File saveTo) {
+                if (!decision.complete(saveTo) && running) {
+                    l.onFileFailed(from, name, "Yêu cầu nhận file đã hết hạn trước khi bạn xác nhận.");
+                }
+            }
             @Override public void reject() { decision.complete(null); }
+            @Override public boolean isExpired() { return decision.isCancelled(); }
         });
         File target;
         try {
             target = decision.get(FILE_DECISION_TIMEOUT_S, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
+            decision.cancel(false);
             PacketIO.send(out, Packet.fileReject("Hết thời gian chờ đối phương trả lời."));
+            l.onFileFailed(from, name, "Hết thời gian chờ xác nhận (quá " + FILE_DECISION_TIMEOUT_S + " giây).");
             return;
         } catch (Exception e) {
+            decision.cancel(false);
             PacketIO.send(out, Packet.fileReject("Đối phương không thể nhận file."));
+            if (running) l.onFileFailed(from, name, "Không thể xác nhận nhận file.");
             return;
         }
         if (target == null) {
@@ -305,40 +318,41 @@ public class PeerNode implements PeerService {
             return;
         }
 
-        PacketIO.send(out, Packet.fileAccept());
-        socket.setSoTimeout(FILE_IO_TIMEOUT_MS);
-
         // Ghi vào file tạm .part, đủ dữ liệu mới đổi tên -> không bao giờ để lại file hỏng với tên thật
         File tmp = new File(target.getPath() + ".part");
         long received = 0;
         int lastPct = -1;
         MessageDigest digest = newSha256();
         String expectedHash = null;
-        try (OutputStream fos = new BufferedOutputStream(new FileOutputStream(tmp))) {
-            if (size == 0) report(from, name, 100, false);
-            while (true) {
-                Packet p = PacketIO.receive(in);
-                if (p.getType() == PacketType.FILE_END) {
-                    expectedHash = p.getContent();
-                    break;
+        try {
+            PacketIO.send(out, Packet.fileAccept());
+            socket.setSoTimeout(FILE_IO_TIMEOUT_MS);
+            try (OutputStream fos = new BufferedOutputStream(new FileOutputStream(tmp))) {
+                if (size == 0) report(from, name, 100, false);
+                while (true) {
+                    Packet p = PacketIO.receive(in);
+                    if (p.getType() == PacketType.FILE_END) {
+                        expectedHash = p.getContent();
+                        break;
+                    }
+                    if (p.getType() != PacketType.FILE_CHUNK || p.getData() == null) {
+                        throw new IOException("Nhận được gói tin không hợp lệ giữa chừng.");
+                    }
+                    received += p.getData().length;
+                    if (received > size) throw new IOException("Dữ liệu nhiều hơn dung lượng đã khai báo.");
+                    fos.write(p.getData());
+                    digest.update(p.getData());
+                    int pct = size == 0 ? 100 : (int) (received * 100 / size);
+                    if (pct != lastPct) {
+                        lastPct = pct;
+                        report(from, name, pct, false);
+                    }
                 }
-                if (p.getType() != PacketType.FILE_CHUNK || p.getData() == null) {
-                    throw new IOException("Nhận được gói tin không hợp lệ giữa chừng.");
+                if (received != size) throw new IOException("Thiếu dữ liệu (" + received + "/" + size + " byte).");
+                // Đối chiếu SHA-256: bảo đảm file nhận được GIỐNG HỆT bản gốc
+                if (expectedHash == null || !expectedHash.equalsIgnoreCase(toHex(digest.digest()))) {
+                    throw new IOException("File bị hỏng khi truyền (mã SHA-256 không khớp).");
                 }
-                received += p.getData().length;
-                if (received > size) throw new IOException("Dữ liệu nhiều hơn dung lượng đã khai báo.");
-                fos.write(p.getData());
-                digest.update(p.getData());
-                int pct = size == 0 ? 100 : (int) (received * 100 / size);
-                if (pct != lastPct) {
-                    lastPct = pct;
-                    report(from, name, pct, false);
-                }
-            }
-            if (received != size) throw new IOException("Thiếu dữ liệu (" + received + "/" + size + " byte).");
-            // Đối chiếu SHA-256: bảo đảm file nhận được GIỐNG HỆT bản gốc
-            if (expectedHash == null || !expectedHash.equalsIgnoreCase(toHex(digest.digest()))) {
-                throw new IOException("File bị hỏng khi truyền (mã SHA-256 không khớp).");
             }
         } catch (IOException e) {
             tmp.delete();
@@ -367,15 +381,23 @@ public class PeerNode implements PeerService {
 
     @Override
     public void sendMessage(String toUser, String content) throws IOException {
-        PeerInfo target = requireOnline(toUser);
+        PeerInfo target = null;
         IOException last = null;
         for (int attempt = 0; attempt < 2; attempt++) {
+            target = requireOnline(toUser);   // lấy lại địa chỉ mới nhất ở mỗi lần thử (tránh dùng IP:port cũ khi retry)
             PeerConnection c = connections.get(toUser);
             boolean reused = (c != null);
             try {
                 if (c == null) {
-                    c = new PeerConnection(target);
-                    connections.put(toUser, c);
+                    PeerConnection created = new PeerConnection(target);
+                    PeerConnection existing = connections.putIfAbsent(toUser, created);
+                    if (existing != null) {
+                        created.close();
+                        c = existing;
+                        reused = true;
+                    } else {
+                        c = created;
+                    }
                 }
                 c.sendMessage(content);
                 return;

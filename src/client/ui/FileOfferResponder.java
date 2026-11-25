@@ -13,4 +13,7 @@ public interface FileOfferResponder {
 
     /** Từ chối nhận file. */
     void reject();
+
+    /** Trả về true nếu lời đề nghị đã hết thời gian chờ hoặc bị hủy trước khi người dùng trả lời. */
+    default boolean isExpired() { return false; }
 }
