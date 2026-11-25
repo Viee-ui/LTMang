@@ -6,6 +6,7 @@ import client.ui.PeerService;
 import common.Packet;
 import common.PacketIO;
 import common.PacketType;
+import common.Protocol;
 import common.PeerInfo;
 
 import java.io.BufferedInputStream;
@@ -27,6 +28,8 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -67,6 +70,7 @@ public class PeerNode implements PeerService {
     private ServerSocket serverSocket;
     private Socket trackerSocket;
     private ObjectOutputStream trackerOut;
+    private final Object trackerLock = new Object();   // heartbeat và UNREGISTER cùng ghi vào trackerOut
     private ExecutorService pool;
 
     /** username -> địa chỉ P2P (cập nhật mỗi khi Tracker gửi danh sách mới). */
@@ -108,7 +112,7 @@ public class PeerNode implements PeerService {
             Packet reply = PacketIO.receive(trackerIn);
             if (reply.getType() == PacketType.REGISTER_FAIL) throw new IOException(reply.getContent());
             if (reply.getType() != PacketType.REGISTER_OK) throw new IOException("Tracker trả lời không hợp lệ.");
-            trackerSocket.setSoTimeout(0);
+            trackerSocket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);   // Tracker im lặng quá lâu = coi như mất
             localIp = reply.getContent();
 
             // 4. Chạy các luồng nền
@@ -120,6 +124,7 @@ public class PeerNode implements PeerService {
             });
             pool.execute(this::acceptLoop);
             pool.execute(() -> trackerLoop(trackerIn));
+            pool.execute(this::heartbeatLoop);
             handleOnlineList(reply.getPeers());
         } catch (IOException | RuntimeException e) {
             closeAll();            // thất bại giữa chừng: dọn sạch để lần đăng nhập sau không bị "port đang bận"
@@ -133,7 +138,7 @@ public class PeerNode implements PeerService {
         running = false;           // đặt TRƯỚC khi đóng socket để các luồng nền biết đây là thoát chủ động
         if (wasRunning && trackerOut != null) {
             try {
-                PacketIO.send(trackerOut, Packet.unregister(username));
+                sendToTracker(Packet.unregister(username));
             } catch (IOException ignored) {
                 // Tracker đã đứt thì thôi
             }
@@ -164,11 +169,37 @@ public class PeerNode implements PeerService {
                 Packet p = PacketIO.receive(in);
                 if (p.getType() == PacketType.ONLINE_LIST) handleOnlineList(p.getPeers());
             }
+        } catch (SocketTimeoutException e) {
+            notifyTrackerLost("Tracker không phản hồi (mất heartbeat).");
         } catch (IOException e) {
-            if (running) {         // chỉ báo khi KHÔNG phải do mình chủ động thoát
-                ChatUIListener l = ui;
-                if (l != null) l.onTrackerDisconnected("Tracker đã đóng kết nối (" + explain(e) + ").");
+            notifyTrackerLost("Tracker đã đóng kết nối (" + explain(e) + ").");
+        }
+    }
+
+    private void notifyTrackerLost(String reason) {
+        if (!running) return;      // chỉ báo khi KHÔNG phải do mình chủ động thoát
+        ChatUIListener l = ui;
+        if (l != null) l.onTrackerDisconnected(reason);
+    }
+
+    /** Định kỳ gửi PING; Tracker trả PONG. Nhờ vậy cả hai bên phát hiện được đối phương "chết lặng" (mất mạng, treo máy). */
+    private void heartbeatLoop() {
+        try {
+            while (running) {
+                Thread.sleep(Protocol.HEARTBEAT_INTERVAL_MS);
+                if (!running) break;
+                sendToTracker(Packet.ping());
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            // gửi lỗi: trackerLoop sẽ tự phát hiện và báo lên giao diện
+        }
+    }
+
+    private void sendToTracker(Packet p) throws IOException {
+        synchronized (trackerLock) {
+            if (trackerOut != null) PacketIO.send(trackerOut, p);
         }
     }
 
@@ -281,17 +312,23 @@ public class PeerNode implements PeerService {
         File tmp = new File(target.getPath() + ".part");
         long received = 0;
         int lastPct = -1;
+        MessageDigest digest = newSha256();
+        String expectedHash = null;
         try (OutputStream fos = new BufferedOutputStream(new FileOutputStream(tmp))) {
             if (size == 0) report(from, name, 100, false);
             while (true) {
                 Packet p = PacketIO.receive(in);
-                if (p.getType() == PacketType.FILE_END) break;
+                if (p.getType() == PacketType.FILE_END) {
+                    expectedHash = p.getContent();
+                    break;
+                }
                 if (p.getType() != PacketType.FILE_CHUNK || p.getData() == null) {
                     throw new IOException("Nhận được gói tin không hợp lệ giữa chừng.");
                 }
                 received += p.getData().length;
                 if (received > size) throw new IOException("Dữ liệu nhiều hơn dung lượng đã khai báo.");
                 fos.write(p.getData());
+                digest.update(p.getData());
                 int pct = size == 0 ? 100 : (int) (received * 100 / size);
                 if (pct != lastPct) {
                     lastPct = pct;
@@ -299,6 +336,10 @@ public class PeerNode implements PeerService {
                 }
             }
             if (received != size) throw new IOException("Thiếu dữ liệu (" + received + "/" + size + " byte).");
+            // Đối chiếu SHA-256: bảo đảm file nhận được GIỐNG HỆT bản gốc
+            if (expectedHash == null || !expectedHash.equalsIgnoreCase(toHex(digest.digest()))) {
+                throw new IOException("File bị hỏng khi truyền (mã SHA-256 không khớp).");
+            }
         } catch (IOException e) {
             tmp.delete();
             String reason = (e instanceof EOFException || e instanceof SocketException)
@@ -378,11 +419,13 @@ public class PeerNode implements PeerService {
             report(toUser, name, 0, true);
             try (InputStream fis = new BufferedInputStream(new FileInputStream(file), CHUNK_SIZE)) {
                 byte[] buf = new byte[CHUNK_SIZE];
+                MessageDigest digest = newSha256();
                 long sent = 0;
                 int lastPct = 0;
                 int n;
                 while ((n = fis.read(buf)) != -1) {
                     PacketIO.send(out, Packet.fileChunk(n == buf.length ? buf : Arrays.copyOf(buf, n)));
+                    digest.update(buf, 0, n);
                     sent += n;
                     int pct = size == 0 ? 100 : (int) (sent * 100 / size);
                     if (pct != lastPct) {
@@ -390,8 +433,8 @@ public class PeerNode implements PeerService {
                         report(toUser, name, pct, true);
                     }
                 }
+                PacketIO.send(out, Packet.fileEnd(toHex(digest.digest())));   // kèm SHA-256 cho người nhận đối chiếu
             }
-            PacketIO.send(out, Packet.fileEnd());
 
             Packet done = PacketIO.receive(in);               // chờ người nhận xác nhận ĐÃ LƯU XONG
             if (done.getType() == PacketType.FILE_ERROR) {
@@ -469,6 +512,20 @@ public class PeerNode implements PeerService {
         if (e instanceof EOFException) return "đối phương đã đóng kết nối";
         String m = e.getMessage();
         return (m == null || m.isEmpty()) ? e.getClass().getSimpleName() : m;
+    }
+
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("JVM không hỗ trợ SHA-256", e);   // JDK nào cũng có
+        }
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     private static void closeQuietly(java.io.Closeable c) {

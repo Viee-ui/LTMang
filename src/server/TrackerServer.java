@@ -3,6 +3,7 @@ package server;
 import common.Packet;
 import common.PacketIO;
 import common.PacketType;
+import common.Protocol;
 import common.PeerInfo;
 
 import java.io.EOFException;
@@ -15,6 +16,7 @@ import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -62,8 +64,11 @@ public class TrackerServer {
     public void stop() {
         running = false;
         try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) { }
-        for (Session s : sessions.values()) s.close();
+        // Lấy ra rồi xóa danh sách TRƯỚC khi đóng socket: nếu không, handler của Peer bị đóng trước sẽ
+        // broadcast "danh sách đã đổi" cho các Peer còn lại, làm họ tưởng bạn bè đã offline.
+        List<Session> all = new ArrayList<>(sessions.values());
         sessions.clear();
+        for (Session s : all) s.close();
         pool.shutdownNow();
         log("Tracker đã dừng.");
     }
@@ -108,7 +113,7 @@ public class TrackerServer {
                 return;
             }
 
-            socket.setSoTimeout(0);                                 // đăng ký xong: chờ vô hạn
+            socket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);     // đăng ký xong: im lặng quá lâu = Peer đã chết
             session.send(Packet.registerOk(ip, snapshot()));
             log("+ " + name + " online tại " + ip + ":" + first.getPort() + "  (đang online: " + sessions.size() + ")");
             broadcastOnlineList();
@@ -116,14 +121,17 @@ public class TrackerServer {
             while (running) {                                       // chờ cho tới khi Peer thoát / mất kết nối
                 Packet p = PacketIO.receive(in);
                 if (p.getType() == PacketType.UNREGISTER) break;
+                if (p.getType() == PacketType.PING) session.send(Packet.pong());   // heartbeat: trả lời để Peer biết Tracker còn sống
             }
         } catch (EOFException | SocketException e) {
             // Peer tắt đột ngột / đóng kết nối: bình thường
+        } catch (SocketTimeoutException e) {
+            // mất heartbeat: máy Peer mất mạng / treo mà không đóng kết nối
+            log("! " + name + " không gửi heartbeat trong " + Protocol.HEARTBEAT_TIMEOUT_MS / 1000.0 + " giây, coi như offline");
         } catch (IOException e) {
             log("Lỗi với " + (name != null ? name : socket.getRemoteSocketAddress()) + ": " + e.getMessage());
         } finally {
-            if (session != null) {
-                sessions.remove(name, session);                     // chỉ xóa nếu vẫn là phiên của mình
+            if (session != null && sessions.remove(name, session)) {   // chỉ xóa (và thông báo) nếu vẫn là phiên của mình
                 log("- " + name + " offline  (đang online: " + sessions.size() + ")");
                 broadcastOnlineList();
             }

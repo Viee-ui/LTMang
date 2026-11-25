@@ -8,6 +8,8 @@ public enum PacketType {
     REGISTER_FAIL,   // Tracker -> Peer: thất bại (trùng username, dữ liệu sai...)
     ONLINE_LIST,     // Tracker -> mọi Peer: danh sách online mới (broadcast)
     UNREGISTER,      // Peer -> Tracker: báo thoát
+    PING,            // Peer -> Tracker: "tôi vẫn sống" (heartbeat)
+    PONG,            // Tracker -> Peer: "Tracker vẫn sống"
 
     // ---- Peer <-> Peer: tin nhắn ----
     MESSAGE,         // nội dung tin nhắn
@@ -18,7 +20,7 @@ public enum PacketType {
     FILE_ACCEPT,     // người nhận đồng ý
     FILE_REJECT,     // người nhận từ chối / hết thời gian chờ
     FILE_CHUNK,      // một khối dữ liệu file
-    FILE_END,        // người gửi: đã gửi hết
+    FILE_END,        // người gửi: đã gửi hết (kèm mã SHA-256 của toàn bộ file)
     FILE_DONE,       // người nhận: đã nhận đủ và lưu thành công
     FILE_ERROR       // người nhận: có lỗi trong lúc nhận
 }

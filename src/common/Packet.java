@@ -55,6 +55,10 @@ public class Packet implements Serializable {
         return p;
     }
 
+    public static Packet ping() { return new Packet(PacketType.PING); }
+
+    public static Packet pong() { return new Packet(PacketType.PONG); }
+
     // ---------- Peer <-> Peer ----------
     public static Packet message(String sender, String content) {
         Packet p = new Packet(PacketType.MESSAGE);
@@ -87,7 +91,12 @@ public class Packet implements Serializable {
         return p;
     }
 
-    public static Packet fileEnd() { return new Packet(PacketType.FILE_END); }
+    /** sha256Hex: mã băm SHA-256 (dạng hex) của toàn bộ file để người nhận đối chiếu. */
+    public static Packet fileEnd(String sha256Hex) {
+        Packet p = new Packet(PacketType.FILE_END);
+        p.content = sha256Hex;
+        return p;
+    }
 
     public static Packet fileDone() { return new Packet(PacketType.FILE_DONE); }
 
