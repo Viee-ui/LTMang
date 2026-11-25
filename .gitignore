@@ -1,0 +1,24 @@
+# Compiled Java output
+out/
+build/
+target/
+*.class
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
