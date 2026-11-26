@@ -1,5 +1,7 @@
 package client.ui;
 
+import common.TrackerDiscovery;
+
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
@@ -7,6 +9,7 @@ import java.net.BindException;
 import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Pattern;
 
@@ -27,6 +30,7 @@ public class LoginFrame extends JFrame {
     private final JCheckBox chkAutoPort = new JCheckBox("Tự động chọn port trống", true);
     private final JTextField txtP2pPort = new JTextField();
     private final JLabel lblError = new JLabel(" ");
+    private final UITheme.FlatButton btnDiscover = new UITheme.FlatButton("Tìm trong LAN", UITheme.BORDER, UITheme.TEXT);
     private final UITheme.FlatButton btnLogin = new UITheme.FlatButton("Đăng nhập", UITheme.PRIMARY, Color.WHITE);
 
     public LoginFrame(PeerService peerService) {
@@ -65,15 +69,30 @@ public class LoginFrame extends JFrame {
         UITheme.styleField(txtUsername);
         row = addLabeled(root, c, row, "Tên hiển thị (Username)", txtUsername);
 
-        // Tracker IP + Port
+        // Tracker IP + Port + nút quét LAN (UDP Broadcast)
         UITheme.styleField(txtTrackerIp);
         UITheme.styleField(txtTrackerPort);
         txtTrackerPort.setPreferredSize(new Dimension(84, txtTrackerPort.getPreferredSize().height));
+        btnDiscover.setFont(UITheme.FONT_SMALL.deriveFont(Font.BOLD));
+        btnDiscover.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
+        btnDiscover.addActionListener(e -> doDiscover());
+
+        JLabel lblTracker = new JLabel("Tracker Server (IP : Port)");
+        lblTracker.setFont(UITheme.FONT_BOLD);
+        lblTracker.setForeground(UITheme.TEXT);
+        JPanel trackerHeader = new JPanel(new BorderLayout(8, 0));
+        trackerHeader.setOpaque(false);
+        trackerHeader.add(lblTracker, BorderLayout.WEST);
+        trackerHeader.add(btnDiscover, BorderLayout.EAST);
+        c.gridy = row++; c.insets = new Insets(0, 0, 5, 0);
+        root.add(trackerHeader, c);
+
         JPanel trackerRow = new JPanel(new BorderLayout(8, 0));
         trackerRow.setOpaque(false);
         trackerRow.add(txtTrackerIp, BorderLayout.CENTER);
         trackerRow.add(txtTrackerPort, BorderLayout.EAST);
-        row = addLabeled(root, c, row, "Tracker Server (IP : Port)", trackerRow);
+        c.gridy = row++; c.insets = new Insets(0, 0, 14, 0);
+        root.add(trackerRow, c);
 
         // Port P2P
         UITheme.styleField(txtP2pPort);
@@ -192,9 +211,55 @@ public class LoginFrame extends JFrame {
         return p;
     }
 
+    private void doDiscover() {
+        btnDiscover.setEnabled(false);
+        btnDiscover.setText("Đang tìm...");
+        showStatus("Đang quét Tracker Server trong mạng LAN (UDP)...", UITheme.TEXT_MUTED);
+        new SwingWorker<List<TrackerDiscovery.TrackerEndpoint>, Void>() {
+            @Override
+            protected List<TrackerDiscovery.TrackerEndpoint> doInBackground() throws Exception {
+                return TrackerDiscovery.discover();
+            }
+
+            @Override
+            protected void done() {
+                btnDiscover.setText("Tìm trong LAN");
+                btnDiscover.setEnabled(btnLogin.isEnabled());
+                try {
+                    List<TrackerDiscovery.TrackerEndpoint> found = get();
+                    if (found.isEmpty()) {
+                        showError("Không tìm thấy Tracker nào trong mạng LAN. Kiểm tra Tracker đã chạy và tường lửa.");
+                        return;
+                    }
+                    TrackerDiscovery.TrackerEndpoint chosen = found.get(0);
+                    if (found.size() > 1) {
+                        Object pick = JOptionPane.showInputDialog(LoginFrame.this,
+                                "Tìm thấy nhiều Tracker trong mạng LAN. Hãy chọn một máy:",
+                                "Chọn Tracker Server", JOptionPane.QUESTION_MESSAGE, null,
+                                found.toArray(), chosen);
+                        if (pick == null) {
+                            showStatus(" ", UITheme.ERROR);
+                            return;
+                        }
+                        chosen = (TrackerDiscovery.TrackerEndpoint) pick;
+                    }
+                    txtTrackerIp.setText(chosen.getIp());
+                    txtTrackerPort.setText(String.valueOf(chosen.getPort()));
+                    showStatus("Đã tìm thấy Tracker tại " + chosen, UITheme.SUCCESS_TEXT);
+                    if (txtUsername.getText().trim().isEmpty()) txtUsername.requestFocusInWindow();
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException ex) {
+                    showError("Lỗi khi quét mạng LAN: " + describe(ex.getCause(), "", 0));
+                }
+            }
+        }.execute();
+    }
+
     private void setBusy(boolean busy) {
         btnLogin.setEnabled(!busy);
         btnLogin.setText(busy ? "Đang kết nối..." : "Đăng nhập");
+        btnDiscover.setEnabled(!busy);
         txtUsername.setEnabled(!busy);
         txtTrackerIp.setEnabled(!busy);
         txtTrackerPort.setEnabled(!busy);
@@ -204,6 +269,11 @@ public class LoginFrame extends JFrame {
     }
 
     private void showError(String message) {
+        showStatus(message, UITheme.ERROR);
+    }
+
+    private void showStatus(String message, Color color) {
+        lblError.setForeground(color);
         lblError.setText("<html><body style='width:300px'>" + UITheme.toHtml(message) + "</body></html>");
     }
 

@@ -328,10 +328,12 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
     @Override
     public void onTrackerDisconnected(String reason) {
         SwingUtilities.invokeLater(() -> {
-            lblMyStatus.setIcon(new UITheme.DotIcon(UITheme.OFFLINE, 10));
-            lblMyStatus.setText("Mất kết nối Tracker");
+            boolean reconnecting = reason != null && (reason.contains("kết nối lại") || reason.contains("thử lại"))
+                    && !reason.startsWith("Không thể kết nối lại");
+            lblMyStatus.setIcon(new UITheme.DotIcon(reconnecting ? UITheme.WARNING : UITheme.OFFLINE, 10));
+            lblMyStatus.setText(reconnecting ? "Đang kết nối lại Tracker..." : "Mất kết nối Tracker");
             lblMyStatus.setToolTipText(reason);
-            lblOnlineCaption.setText("DANH SÁCH CÓ THỂ ĐÃ CŨ");
+            lblOnlineCaption.setText(reconnecting ? "ĐANG THỬ KẾT NỐI LẠI..." : "DANH SÁCH CÓ THỂ ĐÃ CŨ");
         });
     }
 
@@ -360,6 +362,7 @@ public class ChatMainFrame extends JFrame implements ChatUIListener {
         lblMyStatus.setIcon(new UITheme.DotIcon(UITheme.ONLINE, 10));
         lblMyStatus.setText("Online");
         lblMyStatus.setToolTipText(null);
+        lblMyAddress.setText(peerService.getLocalIp() + ":" + peerService.getP2pPort());
         updateOnlineCaption();
 
         if (currentPeer == null) {

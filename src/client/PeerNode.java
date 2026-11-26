@@ -39,8 +39,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Lõi mạng của Peer: vừa là TCP Server (nhận kết nối từ Peer khác) vừa là TCP Client
@@ -63,6 +65,8 @@ public class PeerNode implements PeerService {
 
     private volatile ChatUIListener ui;
     private volatile String username;
+    private volatile String trackerHost;
+    private volatile int trackerPort;
     private volatile String localIp = "?";
     private volatile int p2pPort;
     private volatile boolean running;
@@ -70,8 +74,9 @@ public class PeerNode implements PeerService {
     private ServerSocket serverSocket;
     private Socket trackerSocket;
     private ObjectOutputStream trackerOut;
-    private final Object trackerLock = new Object();   // heartbeat và UNREGISTER cùng ghi vào trackerOut
+    private final Object trackerLock = new Object();   // heartbeat, reconnect và UNREGISTER cùng dùng trackerOut
     private final Object onlineLock = new Object();    // cập nhật danh sách online tuần tự, tránh ghi đè ngược thứ tự
+    private final AtomicLong trackerGeneration = new AtomicLong(); // đánh dấu phiên kết nối Tracker hiện tại
     private ExecutorService pool;
 
     /** username -> địa chỉ P2P (cập nhật mỗi khi Tracker gửi danh sách mới). */
@@ -95,38 +100,27 @@ public class PeerNode implements PeerService {
             throws IOException {
         if (running) throw new IllegalStateException("PeerNode đã chạy rồi.");
         this.username = username == null ? "" : username.trim();
+        this.trackerHost = trackerHost;
+        this.trackerPort = trackerPort;
         try {
             // 1. Mở ServerSocket để các Peer khác kết nối vào (cổng 0 = hệ điều hành chọn cổng trống)
             serverSocket = new ServerSocket(requestedPort);
             this.p2pPort = serverSocket.getLocalPort();
 
-            // 2. Kết nối Tracker (có timeout để không treo giao diện khi IP sai)
-            trackerSocket = new Socket();
-            trackerSocket.setKeepAlive(true);
-            trackerSocket.connect(new InetSocketAddress(trackerHost, trackerPort), CONNECT_TIMEOUT_MS);
-            trackerSocket.setSoTimeout(REGISTER_TIMEOUT_MS);
-            trackerOut = PacketIO.openOutput(trackerSocket);
-            ObjectInputStream trackerIn = PacketIO.openInput(trackerSocket);
+            // 2. Kết nối Tracker, đăng ký và nạp danh sách online ban đầu TRƯỚC khi chạy trackerLoop
+            ObjectInputStream trackerIn = connectAndRegister(true);
 
-            // 3. Đăng ký và chờ Tracker trả lời
-            PacketIO.send(trackerOut, Packet.register(this.username, p2pPort));
-            Packet reply = PacketIO.receive(trackerIn);
-            if (reply.getType() == PacketType.REGISTER_FAIL) throw new IOException(reply.getContent());
-            if (reply.getType() != PacketType.REGISTER_OK) throw new IOException("Tracker trả lời không hợp lệ.");
-            trackerSocket.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);   // Tracker im lặng quá lâu = coi như mất
-            localIp = reply.getContent();
-
-            // 4. Nạp danh sách online ban đầu TRƯỚC khi chạy trackerLoop để tránh gói cũ ghi đè gói mới / đè trạng thái mất kết nối
+            // 3. Chạy các luồng nền
             running = true;
-            handleOnlineList(reply.getPeers());
             pool = Executors.newCachedThreadPool(r -> {
                 Thread t = new Thread(r, "peer-net");
                 t.setDaemon(true);
                 return t;
             });
+            long gen = trackerGeneration.incrementAndGet();
             pool.execute(this::acceptLoop);
-            pool.execute(() -> trackerLoop(trackerIn));
-            pool.execute(this::heartbeatLoop);
+            pool.execute(() -> manageTrackerLoop(trackerIn));
+            pool.execute(() -> heartbeatLoop(gen));
         } catch (IOException | RuntimeException e) {
             closeAll();            // thất bại giữa chừng: dọn sạch để lần đăng nhập sau không bị "port đang bận"
             throw e;
@@ -137,7 +131,7 @@ public class PeerNode implements PeerService {
     public synchronized void stop() {
         boolean wasRunning = running;
         running = false;           // đặt TRƯỚC khi đóng socket để các luồng nền biết đây là thoát chủ động
-        if (wasRunning && trackerOut != null) {
+        if (wasRunning) {
             try {
                 sendToTracker(Packet.unregister(username));
             } catch (IOException ignored) {
@@ -149,32 +143,129 @@ public class PeerNode implements PeerService {
 
     private void closeAll() {
         running = false;
-        closeQuietly(trackerSocket);
+        closeTrackerConnection();
         closeQuietly(serverSocket);
         for (PeerConnection c : connections.values()) c.close();
         connections.clear();
         onlinePeers.clear();
         if (pool != null) pool.shutdownNow();
-        trackerSocket = null;
         serverSocket = null;
-        trackerOut = null;
+    }
+
+    private void closeTrackerConnection() {
+        trackerGeneration.incrementAndGet();   // báo heartbeatLoop của kết nối cũ dừng ngay
+        synchronized (trackerLock) {
+            closeQuietly(trackerSocket);
+            trackerSocket = null;
+            trackerOut = null;
+        }
     }
 
     // =====================================================================
-    //  TRACKER
+    //  TRACKER (kết nối, heartbeat và tự động kết nối lại khi đứt)
     // =====================================================================
 
-    private void trackerLoop(ObjectInputStream in) {
+    /** Mở socket tới Tracker, gửi REGISTER, chờ REGISTER_OK và nạp danh sách online. */
+    private ObjectInputStream connectAndRegister(boolean initial) throws IOException {
+        Socket s = new Socket();
+        try {
+            s.setKeepAlive(true);
+            s.connect(new InetSocketAddress(trackerHost, trackerPort), CONNECT_TIMEOUT_MS);
+            s.setSoTimeout(REGISTER_TIMEOUT_MS);
+            ObjectOutputStream out = PacketIO.openOutput(s);
+            ObjectInputStream in = PacketIO.openInput(s);
+
+            PacketIO.send(out, Packet.register(this.username, p2pPort));
+            Packet reply = PacketIO.receive(in);
+            if (reply.getType() == PacketType.REGISTER_FAIL) {
+                throw new RegisterRejectedException(reply.getContent());
+            }
+            if (reply.getType() != PacketType.REGISTER_OK) {
+                throw new IOException("Tracker trả lời không hợp lệ.");
+            }
+            s.setSoTimeout(Protocol.HEARTBEAT_TIMEOUT_MS);   // Tracker im lặng quá lâu = coi như mất
+
+            synchronized (trackerLock) {
+                if (!initial && !running) {
+                    closeQuietly(s);
+                    return null;
+                }
+                trackerSocket = s;
+                trackerOut = out;
+                localIp = reply.getContent();
+            }
+            handleOnlineList(reply.getPeers());
+            return in;
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(s);
+            throw e;
+        }
+    }
+
+    /** Vòng đời kết nối Tracker: đọc gói tin -> nếu đứt thì tự thử kết nối lại (Exponential Backoff). */
+    private void manageTrackerLoop(ObjectInputStream initialIn) {
+        ObjectInputStream in = initialIn;
+        while (running) {
+            String lostReason = readTrackerUntilLost(in);
+            if (!running) return;
+
+            // Đóng kết nối Tracker cũ (ServerSocket P2P và các cuộc chat đang mở vẫn hoạt động bình thường)
+            closeTrackerConnection();
+            notifyTrackerLost(lostReason + " Đang tự động kết nối lại...");
+
+            in = reconnectWithBackoff();
+            if (in == null) return;   // đã stop() hoặc bị Tracker từ chối vĩnh viễn (REGISTER_FAIL)
+
+            long gen = trackerGeneration.incrementAndGet();
+            try {
+                if (running && pool != null) pool.execute(() -> heartbeatLoop(gen));
+            } catch (RejectedExecutionException ignored) {
+                return;
+            }
+        }
+    }
+
+    private String readTrackerUntilLost(ObjectInputStream in) {
         try {
             while (running) {
                 Packet p = PacketIO.receive(in);
                 if (p.getType() == PacketType.ONLINE_LIST) handleOnlineList(p.getPeers());
             }
+            return null;
         } catch (SocketTimeoutException e) {
-            notifyTrackerLost("Tracker không phản hồi (mất heartbeat).");
+            return "Tracker không phản hồi (mất heartbeat).";
         } catch (IOException e) {
-            notifyTrackerLost("Tracker đã đóng kết nối (" + explain(e) + ").");
+            return "Tracker đã đóng kết nối (" + explain(e) + ").";
         }
+    }
+
+    /** Thử đăng ký lại với Tracker theo chu kỳ tăng dần: 2s -> 4s -> 8s -> tối đa 15s. */
+    private ObjectInputStream reconnectWithBackoff() {
+        long delayMs = Math.max(100, Protocol.RECONNECT_INITIAL_MS);
+        long maxDelayMs = Math.max(delayMs, Protocol.RECONNECT_MAX_MS);
+        int attempt = 0;
+        while (running) {
+            try {
+                Thread.sleep(delayMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+            if (!running) return null;
+            attempt++;
+            try {
+                return connectAndRegister(false);
+            } catch (RegisterRejectedException e) {
+                // Tracker từ chối vĩnh viễn (ví dụ người khác đã lấy username này) -> không lặp vô ích
+                notifyTrackerLost("Không thể kết nối lại Tracker: " + e.getMessage());
+                return null;
+            } catch (IOException e) {
+                delayMs = Math.min(delayMs * 2, maxDelayMs);
+                notifyTrackerLost("Đang thử kết nối lại Tracker (lần " + attempt + " thất bại: "
+                        + explain(e) + ", thử lại sau " + formatSeconds(delayMs) + ")...");
+            }
+        }
+        return null;
     }
 
     private void notifyTrackerLost(String reason) {
@@ -184,17 +275,17 @@ public class PeerNode implements PeerService {
     }
 
     /** Định kỳ gửi PING; Tracker trả PONG. Nhờ vậy cả hai bên phát hiện được đối phương "chết lặng" (mất mạng, treo máy). */
-    private void heartbeatLoop() {
+    private void heartbeatLoop(long gen) {
         try {
-            while (running) {
+            while (running && trackerGeneration.get() == gen) {
                 Thread.sleep(Protocol.HEARTBEAT_INTERVAL_MS);
-                if (!running) break;
-                sendToTracker(Packet.ping());
+                if (!running || trackerGeneration.get() != gen) break;
+                sendToTracker(Packet.ping(), gen);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (IOException e) {
-            // gửi lỗi: trackerLoop sẽ tự phát hiện và báo lên giao diện
+            // gửi lỗi: manageTrackerLoop sẽ tự phát hiện và tự động kết nối lại
         }
     }
 
@@ -202,6 +293,23 @@ public class PeerNode implements PeerService {
         synchronized (trackerLock) {
             if (trackerOut != null) PacketIO.send(trackerOut, p);
         }
+    }
+
+    private void sendToTracker(Packet p, long expectedGen) throws IOException {
+        synchronized (trackerLock) {
+            if (trackerGeneration.get() == expectedGen && trackerOut != null) {
+                PacketIO.send(trackerOut, p);
+            }
+        }
+    }
+
+    /** Ngoại lệ nội bộ phân biệt Tracker từ chối nghiệp vụ (REGISTER_FAIL) với lỗi mạng tạm thời. */
+    private static final class RegisterRejectedException extends IOException {
+        RegisterRejectedException(String message) { super(message); }
+    }
+
+    private static String formatSeconds(long ms) {
+        return (ms % 1000 == 0) ? (ms / 1000) + "s" : String.format("%.1fs", ms / 1000.0);
     }
 
     private void handleOnlineList(List<PeerInfo> list) {

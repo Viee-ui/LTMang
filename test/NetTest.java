@@ -24,6 +24,7 @@ public class NetTest {
         final AtomicInteger progressCalls = new AtomicInteger();
         final AtomicInteger lastSendPct = new AtomicInteger(-1), lastRecvPct = new AtomicInteger(-1);
         final AtomicBoolean trackerLost = new AtomicBoolean();
+        volatile String lastDisconnectReason;
         volatile File acceptTo;                      // null => từ chối
         volatile String offeredName; volatile long offeredSize;
         public void onOnlineListUpdated(List<PeerInfo> l) { online = l; }
@@ -37,7 +38,7 @@ public class NetTest {
         }
         public void onFileReceived(String f, File saved) { received.add(saved); }
         public void onFileFailed(String p, String n, String r) { failed.add(r); }
-        public void onTrackerDisconnected(String r) { trackerLost.set(true); }
+        public void onTrackerDisconnected(String r) { lastDisconnectReason = r; trackerLost.set(true); }
         boolean seen(String u) { for (PeerInfo p : online) if (p.getUsername().equals(u)) return true; return false; }
     }
 
@@ -53,9 +54,19 @@ public class NetTest {
     }
 
     public static void main(String[] a) throws Exception {
-        TrackerServer tracker = new TrackerServer(0);   // cổng trống
+        TrackerServer tracker = new TrackerServer(0, 0);   // cổng TCP và UDP discovery trống
         tracker.start();
         int tp = tracker.getPort();
+        int dp = tracker.getDiscoveryPort();
+
+        // ---------- UDP Auto-Discovery ----------
+        check("Tracker mở được cổng UDP Discovery: " + dp, dp > 0);
+        List<common.TrackerDiscovery.TrackerEndpoint> discovered = common.TrackerDiscovery.discover(dp, 600);
+        boolean foundRightPort = false;
+        for (common.TrackerDiscovery.TrackerEndpoint ep : discovered) {
+            if (ep.getPort() == tp) { foundRightPort = true; break; }
+        }
+        check("UDP Discovery tìm thấy đúng Tracker TCP port " + tp + " (" + discovered + ")", foundRightPort);
 
         // ---------- Đăng nhập ----------
         Rec ra = new Rec(), rb = new Rec();
@@ -237,7 +248,30 @@ public class NetTest {
         A.sendMessage("Bob", "Tracker chết rồi nhưng vẫn chat được");
         check("Tracker sập: chat P2P vẫn hoạt động", "Alice:Tracker chết rồi nhưng vẫn chat được".equals(rb2.msgs.poll(2, TimeUnit.SECONDS)));
 
-        A.stop(); B2.stop();
+        // ---------- Auto-Reconnect khi Tracker khởi động lại trên cùng cổng ----------
+        TrackerServer tracker2 = new TrackerServer(tp, -1);
+        tracker2.start();
+        PeerNode D = new PeerNode(); Rec rd = new Rec(); D.setListener(rd);
+        D.start("Dave", "127.0.0.1", tp, 0);
+        int reconnectWaitMs = Math.max(4000, common.Protocol.RECONNECT_INITIAL_MS * 3);
+        check("Tracker bật lại -> A tự động reconnect và thấy Dave", waitFor(() -> ra.seen("Dave"), reconnectWaitMs));
+        check("Tracker bật lại -> B2 tự động reconnect và thấy Dave", waitFor(() -> rb2.seen("Dave"), reconnectWaitMs));
+        check("Dave thấy cả Alice và Bob sau khi họ auto-reconnect", waitFor(() -> rd.seen("Alice") && rd.seen("Bob"), 2000));
+        A.sendMessage("Dave", "chào Dave sau khi reconnect");
+        check("A chat được với peer mới Dave sau khi auto-reconnect", "Alice:chào Dave sau khi reconnect".equals(rd.msgs.poll(2, TimeUnit.SECONDS)));
+
+        // ---------- Reconnect bị Tracker từ chối (trùng tên với người mới) ----------
+        tracker2.stop();
+        ra.lastDisconnectReason = null;
+        TrackerServer tracker3 = new TrackerServer(tp, -1);
+        tracker3.start();
+        PeerNode imposter = new PeerNode(); imposter.setListener(new Rec());
+        imposter.start("Alice", "127.0.0.1", tp, 0);
+        check("Reconnect bị trùng username -> A báo lỗi vĩnh viễn", waitFor(
+                () -> ra.lastDisconnectReason != null && ra.lastDisconnectReason.contains("Không thể kết nối lại"),
+                reconnectWaitMs));
+
+        imposter.stop(); D.stop(); A.stop(); B2.stop(); tracker3.stop();
         System.out.println("\nKẾT QUẢ: " + pass + " PASS, " + fail + " FAIL");
         System.exit(fail == 0 ? 0 : 1);
     }

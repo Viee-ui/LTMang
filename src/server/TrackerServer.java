@@ -10,6 +10,8 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -17,6 +19,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -44,27 +47,58 @@ public class TrackerServer {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private final int port;
-    private final Map<String, Session> sessions = new ConcurrentHashMap<>();   // username -> phiên
+    private final int discoveryPort;
+    private final Map<String, Session> sessions = new ConcurrentHashMap<>();   // username (chữ thường) -> phiên
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private volatile ServerSocket serverSocket;
+    private volatile DatagramSocket discoverySocket;
     private volatile boolean running;
 
-    public TrackerServer(int port) { this.port = port; }
+    public TrackerServer(int port) { this(port, Protocol.DISCOVERY_PORT); }
 
-    /** Mở cổng và bắt đầu nhận kết nối ở luồng riêng (không chặn). */
+    /**
+     * @param port          cổng TCP lắng nghe Peer (0 = hệ điều hành chọn cổng trống).
+     * @param discoveryPort cổng UDP lắng nghe gói broadcast tìm Tracker (&lt; 0 để tắt, 0 = chọn cổng trống).
+     */
+    public TrackerServer(int port, int discoveryPort) {
+        this.port = port;
+        this.discoveryPort = discoveryPort;
+    }
+
+    /** Mở cổng TCP + UDP Discovery và bắt đầu nhận kết nối ở luồng riêng (không chặn). */
     public void start() throws IOException {
         serverSocket = new ServerSocket(port);
         running = true;
-        log("Tracker đang chạy, lắng nghe cổng " + serverSocket.getLocalPort());
+        log("Tracker đang chạy, lắng nghe TCP cổng " + serverSocket.getLocalPort());
         Thread acceptThread = new Thread(this::acceptLoop, "tracker-accept");
         acceptThread.start();
+        startDiscovery();
+    }
+
+    private void startDiscovery() {
+        if (discoveryPort < 0) return;
+        try {
+            DatagramSocket ds = new DatagramSocket(discoveryPort);
+            ds.setBroadcast(true);
+            discoverySocket = ds;
+            log("UDP Discovery đang lắng nghe cổng " + ds.getLocalPort() + " (hỗ trợ tự tìm Tracker trong LAN)");
+            Thread t = new Thread(this::discoveryLoop, "tracker-discovery");
+            t.setDaemon(true);
+            t.start();
+        } catch (IOException e) {
+            log("Cảnh báo: không mở được cổng UDP Discovery " + discoveryPort + " (" + e.getMessage()
+                    + "). Peer vẫn kết nối được bằng IP thủ công.");
+        }
     }
 
     public int getPort() { return serverSocket == null ? port : serverSocket.getLocalPort(); }
 
+    public int getDiscoveryPort() { return discoverySocket == null ? -1 : discoverySocket.getLocalPort(); }
+
     public void stop() {
         running = false;
         try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) { }
+        if (discoverySocket != null) discoverySocket.close();
         // Lấy ra rồi xóa danh sách TRƯỚC khi đóng socket: nếu không, handler của Peer bị đóng trước sẽ
         // broadcast "danh sách đã đổi" cho các Peer còn lại, làm họ tưởng bạn bè đã offline.
         List<Session> all = new ArrayList<>(sessions.values());
@@ -72,6 +106,27 @@ public class TrackerServer {
         for (Session s : all) s.close();
         pool.shutdownNow();
         log("Tracker đã dừng.");
+    }
+
+    /** Trả lời gói UDP broadcast từ Client để Client tự điền IP + cổng TCP của Tracker. */
+    private void discoveryLoop() {
+        byte[] buf = new byte[256];
+        byte[] replyBytes = (Protocol.DISCOVERY_RESPONSE_PREFIX + getPort()).getBytes(StandardCharsets.UTF_8);
+        while (running) {
+            try {
+                DatagramPacket req = new DatagramPacket(buf, buf.length);
+                discoverySocket.receive(req);
+                String msg = new String(req.getData(), req.getOffset(), req.getLength(), StandardCharsets.UTF_8).trim();
+                if (Protocol.DISCOVERY_REQUEST.equals(msg)) {
+                    DatagramPacket resp = new DatagramPacket(replyBytes, replyBytes.length, req.getAddress(), req.getPort());
+                    discoverySocket.send(resp);
+                }
+            } catch (SocketException e) {
+                break;   // discoverySocket đã đóng khi stop()
+            } catch (IOException e) {
+                if (running) log("Lỗi UDP Discovery: " + e.getMessage());
+            }
+        }
     }
 
     private void acceptLoop() {

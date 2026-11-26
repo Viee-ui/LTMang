@@ -23,7 +23,9 @@ public final class UITheme {
     public static final Color BORDER      = Color.decode("#E5E7EB");
     public static final Color FIELD_BORDER = Color.decode("#D1D5DB");
     public static final Color ONLINE      = Color.decode("#22C55E");
+    public static final Color WARNING     = Color.decode("#F59E0B");
     public static final Color OFFLINE     = Color.decode("#EF4444");
+    public static final Color SUCCESS_TEXT = Color.decode("#15803D");
     public static final Color SELECTED_BG = Color.decode("#DBEAFE");
     public static final Color ERROR       = Color.decode("#DC2626");
 
